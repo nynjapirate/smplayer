@@ -1,6 +1,6 @@
 # SMPlayer (gbit00 fork)
 
-This is a personal fork of [SMPlayer 23.12.0](https://github.com/smplayer-dev/smplayer) with a set of feature patches that target large-folder use, VLC-style playlist UX, hover-thumbnails over the seekbar, keyboard-driven file management, and a more configurable toolbar editor.
+This is a personal fork of [SMPlayer 23.12.0](https://github.com/smplayer-dev/smplayer) with a set of feature patches including YouTube-style seekbar thumbnails, VLC-style playlist UX, keyboard-driven file management, and a more configurable toolbar editor.
 
 Upstream's homepage and documentation: [smplayer.info](https://smplayer.info).
 
