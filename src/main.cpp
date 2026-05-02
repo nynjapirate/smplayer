@@ -20,6 +20,8 @@
 #include "smplayer.h"
 
 #include <QDir>
+#include <QPalette>
+#include <QStyleFactory>
 #ifdef USE_GL_WINDOW
 #include <QSurfaceFormat>
 #endif
@@ -75,6 +77,33 @@ int main( int argc, char ** argv )
 #endif
 
 	MyApplication a( "smplayer", argc, argv );
+
+	// Phase I fork patch: force a Fusion-dark palette when the env var
+	// SMPLAYER_FORCE_DARK=1 is set. The AppImage's AppRun sets this so
+	// the bundled build looks consistent regardless of what desktop theme
+	// the host system has. Set on the application before any window is
+	// constructed so every widget gets the dark palette from the start.
+	if (qgetenv("SMPLAYER_FORCE_DARK") == "1") {
+		QApplication::setStyle(QStyleFactory::create("Fusion"));
+		QPalette p;
+		p.setColor(QPalette::Window,          QColor(0x2b, 0x2b, 0x2b));
+		p.setColor(QPalette::WindowText,      QColor(0xe0, 0xe0, 0xe0));
+		p.setColor(QPalette::Base,            QColor(0x1e, 0x1e, 0x1e));
+		p.setColor(QPalette::AlternateBase,   QColor(0x2b, 0x2b, 0x2b));
+		p.setColor(QPalette::ToolTipBase,     QColor(0x35, 0x35, 0x35));
+		p.setColor(QPalette::ToolTipText,     QColor(0xe0, 0xe0, 0xe0));
+		p.setColor(QPalette::Text,            QColor(0xe0, 0xe0, 0xe0));
+		p.setColor(QPalette::Button,          QColor(0x35, 0x35, 0x35));
+		p.setColor(QPalette::ButtonText,      QColor(0xe0, 0xe0, 0xe0));
+		p.setColor(QPalette::BrightText,      QColor(0xff, 0x55, 0x55));
+		p.setColor(QPalette::Link,            QColor(0x4f, 0xc3, 0xf7));
+		p.setColor(QPalette::Highlight,       QColor(0x4a, 0x90, 0xd9));
+		p.setColor(QPalette::HighlightedText, QColor(0xff, 0xff, 0xff));
+		p.setColor(QPalette::Disabled, QPalette::Text,       QColor(0x80, 0x80, 0x80));
+		p.setColor(QPalette::Disabled, QPalette::ButtonText, QColor(0x80, 0x80, 0x80));
+		p.setColor(QPalette::Disabled, QPalette::WindowText, QColor(0x80, 0x80, 0x80));
+		QApplication::setPalette(p);
+	}
 
 #ifdef USE_GL_WINDOW
 	QSurfaceFormat fmt;
