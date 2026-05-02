@@ -28,6 +28,7 @@
 #include "prefsubtitles.h"
 #include "prefadvanced.h"
 #include "prefplaylist.h"
+#include "prefmovelocations.h"
 #include "prefupdates.h"
 #include "prefnetwork.h"
 #include "infowindow.h"
@@ -114,6 +115,10 @@ PreferencesDialog::PreferencesDialog(QWidget * parent, Qt::WindowFlags f)
 
 	page_advanced = new PrefAdvanced;
 	addSection( page_advanced );
+
+	// Phase E fork patch: custom move locations page.
+	page_move_locations = new PrefMoveLocations;
+	addSection( page_move_locations );
 
 	//sections->setIconSize( QSize(22,22) );
 	sections->setCurrentRow(General);
@@ -219,6 +224,7 @@ void PreferencesDialog::setData(Preferences * pref) {
 #endif
 	page_updates->setData(pref);
 	page_network->setData(pref);
+	page_move_locations->setData(pref);
 
 #if USE_ASSOCIATIONS
 	page_associations->setData(pref);
@@ -239,6 +245,7 @@ void PreferencesDialog::getData(Preferences * pref) {
 #endif
 	page_updates->getData(pref);
 	page_network->getData(pref);
+	page_move_locations->getData(pref);
 
 #if USE_ASSOCIATIONS
 	page_associations->getData(pref);

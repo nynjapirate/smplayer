@@ -17,10 +17,18 @@
 */
 
 #include "toolbareditor.h"
+#include "iconpickerdialog.h"
+#include "toolbaroverrides.h"
 
+#include <QCheckBox>
+#include <QHBoxLayout>
+#include <QInputDialog>
+#include <QListWidget>
+#include <QPushButton>
 #include <QToolBar>
 #include <QToolButton>
 #include <QTransform>
+#include <QVBoxLayout>
 
 #include "images.h"
 
@@ -61,6 +69,32 @@ ToolbarEditor::ToolbarEditor( QWidget* parent, Qt::WindowFlags f )
 	active_actions_list->setDefaultDropAction(Qt::MoveAction); // Qt 4.6
 	//active_actions_list->setDragDropMode(QAbstractItemView::InternalMove);
 #endif
+
+	// Phase G fork patch: per-button override controls — direct buttons,
+	// no in-between dialog. Each opens its own targeted editor (icon
+	// picker, text input, or reset).
+	change_icon_button = new QPushButton(tr("Change Icon…"), this);
+	change_icon_button->setToolTip(tr("Pick a different icon for the selected button"));
+	change_icon_button->setEnabled(false);
+	connect(change_icon_button, SIGNAL(clicked()), this, SLOT(onChangeIconClicked()));
+
+	change_text_button = new QPushButton(tr("Change Text…"), this);
+	change_text_button->setToolTip(tr("Override the displayed text of the selected button"));
+	change_text_button->setEnabled(false);
+	connect(change_text_button, SIGNAL(clicked()), this, SLOT(onChangeTextClicked()));
+
+	reset_overrides_button = new QPushButton(tr("Reset Button"), this);
+	reset_overrides_button->setToolTip(tr("Restore the selected button's default icon and text"));
+	reset_overrides_button->setEnabled(false);
+	connect(reset_overrides_button, SIGNAL(clicked()), this, SLOT(onResetOverridesClicked()));
+
+	icon_only_checkbox = new QCheckBox(tr("Icon Only (fallback to text for buttons without icons)"), this);
+	icon_only_checkbox->setChecked(false);
+
+	horizontalLayout->addWidget(change_icon_button);
+	horizontalLayout->addWidget(change_text_button);
+	horizontalLayout->addWidget(reset_overrides_button);
+	horizontalLayout->addWidget(icon_only_checkbox);
 }
 
 ToolbarEditor::~ToolbarEditor() {
@@ -240,12 +274,102 @@ void ToolbarEditor::checkRowsAllList(int currentRow) {
 void ToolbarEditor::checkRowsActiveList(int currentRow) {
 	qDebug("ToolbarEditor::checkRowsActiveList: current row: %d", currentRow);
 	left_button->setEnabled(currentRow > -1);
+	bool customize_ok = false;
 	if (currentRow == -1) {
 		up_button->setEnabled(false);
 		down_button->setEnabled(false);
 	} else {
 		up_button->setEnabled((currentRow > 0));
 		down_button->setEnabled((currentRow < active_actions_list->count()-1));
+		const QString name = active_actions_list->item(currentRow)->data(Qt::UserRole).toString();
+		customize_ok = (name != "separator" && !name.isEmpty());
+	}
+	change_icon_button->setEnabled(customize_ok);
+	change_text_button->setEnabled(customize_ok);
+	reset_overrides_button->setEnabled(customize_ok);
+}
+
+void ToolbarEditor::setIconOnlyMode(bool b)  { icon_only_checkbox->setChecked(b); }
+bool ToolbarEditor::iconOnlyMode() const     { return icon_only_checkbox->isChecked(); }
+
+static QAction * resolveSelectedAction(QListWidget * list, const QList<QAction*> & all)
+{
+	const int row = list->currentRow();
+	if (row < 0) return 0;
+	const QString name = list->item(row)->data(Qt::UserRole).toString();
+	if (name.isEmpty() || name == "separator") return 0;
+	for (QAction * a : all) if (a && a->objectName() == name) return a;
+	return 0;
+}
+
+void ToolbarEditor::onChangeIconClicked() {
+	QAction * action = resolveSelectedAction(active_actions_list, all_actions_copy);
+	if (!action) return;
+
+	// Build a hint from the action's identity so the picker can surface
+	// likely-related icons at the top.
+	QString hint = action->objectName();
+	if (!action->text().isEmpty()) hint += " " + QString(action->text()).remove('&');
+
+	ToolbarOverrides::Entry e = ToolbarOverrides::load(action->objectName());
+	IconPickerDialog dlg(e.icon, hint, this);
+	if (dlg.exec() == QDialog::Accepted) {
+		const QString picked = dlg.selectedIcon();
+		// Empty result = user clicked OK without picking; treat as a reset
+		// of just the icon override.
+		e.icon = picked;
+		ToolbarOverrides::save(action->objectName(), e);
+		ToolbarOverrides::applyToAction(action);
+		refreshActiveListLabels();
+	}
+}
+
+void ToolbarEditor::onChangeTextClicked() {
+	QAction * action = resolveSelectedAction(active_actions_list, all_actions_copy);
+	if (!action) return;
+
+	ToolbarOverrides::Entry e = ToolbarOverrides::load(action->objectName());
+	QString current = e.text;
+	if (current.isEmpty()) {
+		const QVariant orig = action->property("_smp_orig_text");
+		current = orig.isValid() ? orig.toString() : action->text();
+		current.remove('&');
+	}
+
+	bool ok = false;
+	const QString new_text = QInputDialog::getText(
+		this,
+		tr("Change button text"),
+		tr("Display text for <b>%1</b>:").arg(action->objectName()),
+		QLineEdit::Normal, current, &ok);
+	if (!ok) return;
+
+	e.text = new_text.trimmed();
+	ToolbarOverrides::save(action->objectName(), e);
+	ToolbarOverrides::applyToAction(action);
+	refreshActiveListLabels();
+}
+
+void ToolbarEditor::onResetOverridesClicked() {
+	QAction * action = resolveSelectedAction(active_actions_list, all_actions_copy);
+	if (!action) return;
+	ToolbarOverrides::clear(action->objectName());
+	ToolbarOverrides::applyToAction(action);
+	refreshActiveListLabels();
+}
+
+void ToolbarEditor::refreshActiveListLabels() {
+	for (int i = 0; i < active_actions_list->count(); ++i) {
+		QListWidgetItem * item = active_actions_list->item(i);
+		const QString name = item->data(Qt::UserRole).toString();
+		if (name == "separator" || name.isEmpty()) continue;
+		QAction * a = findAction(name, all_actions_copy);
+		if (!a) continue;
+		const QString text = fixname(a->text(), a->objectName());
+		item->setText(text + " (" + a->objectName() + ")");
+		QIcon ic = a->icon();
+		if (ic.isNull()) ic = Images::icon("empty_icon");
+		item->setIcon(ic);
 	}
 }
 

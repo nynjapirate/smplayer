@@ -16,3 +16,13 @@
 # binaries
 /src/smplayer
 /webserver/simple_web_server
+
+# Per-user config dropped into the source tree by smplayer at runtime
+/src/shortcuts/smp.keys
+
+# IDE / editor noise
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

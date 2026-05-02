@@ -1198,7 +1198,10 @@ void MPVProcess::discButtonPressed(const QString & button_name) {
 #endif
 
 void MPVProcess::setAspect(double aspect) {
-	sendCommand("set video-aspect " + QString::number(aspect));
+	// Phase B fork patch (issue #893): mpv 0.37+ removed the `video-aspect`
+	// property; it was renamed to `video-aspect-override`. Use the new name —
+	// recent mpv only. If you need to run against mpv ≤ 0.36, swap back.
+	sendCommand("set video-aspect-override " + QString::number(aspect));
 }
 
 void MPVProcess::setFullscreen(bool b) {

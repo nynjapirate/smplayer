@@ -5,14 +5,15 @@ CONFIG += qt warn_on
 CONFIG += release
 #CONFIG += debug
 
-QT += network xml
+QT += network xml concurrent
 
 RESOURCES = icons.qrc H2O.qrc
 
 DEFINES += NO_DEBUG_ON_CONSOLE
+# Flip to `#DEFINES += NO_DEBUG_ON_CONSOLE` to surface qDebug() on stderr while debugging.
 #DEFINES += EXPERIMENTAL
 DEFINES += SINGLE_INSTANCE
-DEFINES += FIND_SUBTITLES
+#DEFINES += FIND_SUBTITLES   # disabled in dev fork: avoids qtdeclarative5-dev (qml) build dep. Re-enable + `apt install qtdeclarative5-dev` to restore Find Subtitles dialog.
 DEFINES += VIDEOPREVIEW
 DEFINES += YOUTUBE_SUPPORT
 DEFINES += BLURAY_SUPPORT
@@ -31,7 +32,7 @@ DEFINES += AUTO_SHUTDOWN_PC
 #DEFINES += CAPTURE_STREAM
 DEFINES += BOOKMARKS
 DEFINES += MOUSE_GESTURES
-DEFINES += GLOBALSHORTCUTS
+#DEFINES += GLOBALSHORTCUTS  # disabled in dev fork: needs qtbase5-private-dev. Re-enable + apt install qtbase5-private-dev to restore.
 DEFINES += ADD_BLACKBORDERS_FS
 DEFINES += INITIAL_BLACKBORDERS
 DEFINES += CHROMECAST_SUPPORT
@@ -237,6 +238,15 @@ HEADERS += guiconfig.h \
 	audioequalizer.h \
 	myslider.h \
 	timeslider.h \
+	timetooltip.h \
+	thumbnailprovider.h \
+	playlistthumbprovider.h \
+	playlistthumbdelegate.h \
+	custommove.h \
+	prefmovelocations.h \
+	toolbaroverrides.h \
+	toolbarbuttoneditor.h \
+	iconpickerdialog.h \
 	inputdvddirectory.h \
 	inputurl.h \
 	stereo3ddialog.h \
@@ -337,6 +347,15 @@ SOURCES	+= version.cpp \
 	audioequalizer.cpp \
 	myslider.cpp \
 	timeslider.cpp \
+	timetooltip.cpp \
+	thumbnailprovider.cpp \
+	playlistthumbprovider.cpp \
+	playlistthumbdelegate.cpp \
+	custommove.cpp \
+	prefmovelocations.cpp \
+	toolbaroverrides.cpp \
+	toolbarbuttoneditor.cpp \
+	iconpickerdialog.cpp \
 	inputdvddirectory.cpp \
 	inputurl.cpp \
 	stereo3ddialog.cpp \

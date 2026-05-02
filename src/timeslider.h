@@ -21,8 +21,11 @@
 
 #include "myslider.h"
 #include "config.h"
+#include <QImage>
 
-class TimeSlider : public MySlider 
+class TimeTooltip;
+
+class TimeSlider : public MySlider
 {
 	Q_OBJECT
 
@@ -54,14 +57,31 @@ protected slots:
 	void sliderPressed_slot();
 	void sliderReleased_slot();
 	void valueChanged_slot(int);
+	void onThumbnailReady(qint64 timeMs, const QImage & img);
 #if ENABLE_DELAYED_DRAGGING
 	void checkDragging(int);
 	void sendDelayedPos();
 #endif
 
+public:
+	// Make the widget itself 2× the slider's natural cross-axis size, then
+	// paint the groove + handle at their natural size centred inside it.
+	// Layout reserves the larger area, so hover events fire over the whole
+	// band without any global event filter trickery.
+	virtual QSize sizeHint() const Q_DECL_OVERRIDE;
+	virtual QSize minimumSizeHint() const Q_DECL_OVERRIDE;
+
 protected:
 	virtual void wheelEvent(QWheelEvent * e);
 	virtual bool event(QEvent *event);
+	virtual void leaveEvent(QEvent * event);
+	virtual void mouseMoveEvent(QMouseEvent * event);
+	virtual void mousePressEvent(QMouseEvent * event);
+	virtual void contextMenuEvent(QContextMenuEvent * event);
+	virtual void paintEvent(QPaintEvent * event);
+
+	void updateHoverPreview(int xLocal);
+	QRect naturalVisualRect() const;
 
 private:
 	bool dont_update;
@@ -74,6 +94,9 @@ private:
 	int last_pos_to_send;
 	QTimer * timer;
 #endif
+
+	TimeTooltip * thumb_tooltip;   // lazily created on first hover
+	qint64 last_hover_bucket_ms;   // last bucket we asked for, debounce
 };
 
 #endif

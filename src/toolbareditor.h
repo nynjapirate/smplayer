@@ -27,6 +27,9 @@
 
 class QListWidget;
 
+class QCheckBox;
+class QPushButton;
+
 class ToolbarEditor : public QDialog, public Ui::ToolbarEditor
 {
 	Q_OBJECT
@@ -47,6 +50,10 @@ public:
 	void setIconSize(int size);
 	int iconSize();
 
+	// Phase G fork patch: per-toolbar "icon only with text fallback" mode.
+	void setIconOnlyMode(bool b);
+	bool iconOnlyMode() const;
+
 	//! Save the widget's list of actions into a QStringList 
 	static QStringList save(QWidget *w);
 
@@ -64,6 +71,13 @@ protected slots:
 	void checkRowsAllList(int currentRow);
 	void checkRowsActiveList(int currentRow);
 
+	// Phase G fork patch: per-action icon/text overrides, opened directly
+	// from the toolbar editor à la Dolphin (no in-between Customize dialog).
+	void onChangeIconClicked();
+	void onChangeTextClicked();
+	void onResetOverridesClicked();
+	void refreshActiveListLabels();
+
 protected:
 	static QAction * findAction(QString s, QList<QAction *> actions_list);
 
@@ -74,6 +88,11 @@ protected:
 
 	QList<QAction *> all_actions_copy;
 	QStringList default_actions;
+
+	QPushButton * change_icon_button;
+	QPushButton * change_text_button;
+	QPushButton * reset_overrides_button;
+	QCheckBox   * icon_only_checkbox;
 };
 
 #endif

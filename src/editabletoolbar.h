@@ -47,6 +47,19 @@ public:
 public slots:
 	void edit();
 
+	// Phase G fork patch: per-toolbar "icon-only with text-fallback" mode.
+	// Persisted under [toolbar_settings]/<objectName>/icon_only_mode in
+	// smplayer.ini so it survives restarts. Plus: actions with an explicit
+	// text override get TextBesideIcon (or TextOnly when iconless) so user
+	// edits to "Change Text…" actually render.
+	void setIconOnlyMode(bool b);
+	bool iconOnlyMode() const { return icon_only_mode; }
+	void applyButtonStyles();
+	void loadIconOnlyMode();   // call after setObjectName + before show
+
+protected:
+	void saveIconOnlyMode();
+
 protected:
 	QList<QAction *> allActions();
 
@@ -54,6 +67,7 @@ protected:
 	QWidget * widget;
 
 	QStringList default_actions;
+	bool icon_only_mode;
 };
 
 #endif

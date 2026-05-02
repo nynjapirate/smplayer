@@ -60,6 +60,7 @@ class VolumeSliderAction;
 class TimeLabelAction;
 class InfoWindow;
 class GlobalShortcuts;
+class CustomMoveLocations;
 
 class BaseGuiPlus : public BaseGui
 {
@@ -239,6 +240,9 @@ protected:
 	bool compact_playlist_was_visible;
 	bool ignore_playlist_events;
 #endif
+
+	// Phase E fork patch: keyboard-driven move-current-file feature.
+	CustomMoveLocations * custom_move;
 };
 
 #endif

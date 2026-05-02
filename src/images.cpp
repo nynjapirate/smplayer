@@ -17,6 +17,7 @@
 */
 
 #include "images.h"
+#include <QCoreApplication>
 #include <QFile>
 #include <QDebug>
 
@@ -139,7 +140,17 @@ QString Images::file(const QString & name) {
 
 
 QPixmap Images::icon(QString name, int size) {
-	QString icon_name = file(name);
+	// Phase H fork patch: prefer the fork's own logo PNG (shipped next to
+	// the executable as `smplayer.png`) so the taskbar / window icon makes
+	// the fork visually distinguishable from upstream/apt builds. Falls
+	// back to the bundled default if the file isn't present.
+	QString icon_name;
+	if (name == QLatin1String("logo")) {
+		const QString fork_logo = QCoreApplication::applicationDirPath()
+		                          + "/smplayer.png";
+		if (QFile::exists(fork_logo)) icon_name = fork_logo;
+	}
+	if (icon_name.isEmpty()) icon_name = file(name);
 	QPixmap p(icon_name);
 
 	if (!p.isNull()) {

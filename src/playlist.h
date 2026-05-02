@@ -25,6 +25,8 @@
 #include <QModelIndex>
 #include <QStandardItem>
 #include <QProcess>
+#include <QFutureWatcher>
+#include <QAtomicInt>
 #include "mediadata.h"
 
 #ifdef YOUTUBE_SUPPORT
@@ -92,7 +94,9 @@ class QSettings;
 class QToolButton;
 class QTimer;
 class QMovie;
+class QProgressDialog;
 class URLHistory;
+class PlaylistThumbDelegate;
 
 class Playlist : public QWidget
 {
@@ -156,6 +160,11 @@ public slots:
 
 	// Adds a directory, maybe with recursion (depends on user config)
 	void addDirectory(QString dir);
+
+	// Phase E fork patch: drop a row by absolute filename. Used by the
+	// "move current file" handler so the playlist forgets a file the
+	// instant we rename it on disk, while mpv keeps playing.
+	void removeRowByFilename(const QString & filename);
 
 #ifdef PLAYLIST_DELETE_FROM_DISK
 	void deleteSelectedFileFromDisk();
@@ -253,10 +262,21 @@ signals:
 	void windowTitleChanged(const QString & title);
 
 protected:
+	bool eventFilter(QObject * obj, QEvent * event) Q_DECL_OVERRIDE;
+	void handleInternalDrop(class QDropEvent * de);
+
 	void setCurrentItem(int current);
 	int findCurrentItem();
 	void clearPlayedTag();
 	QString lastDir();
+
+	// Phase C1 fork patch: returns the actual top-level window for which
+	// we should persist geometry. That's `this` when Playlist itself is a
+	// top-level (dockable_playlist=false) or the floating QDockWidget
+	// ancestor when dockable. Returns 0 when docked into a main window —
+	// we don't own that window's geometry.
+	QWidget * ownTopLevelWindow() const;
+	void applyPendingGeometry();
 
 	void setPlaylistFilename(const QString &);
 	QString playlistFilename() { return playlist_filename; };
@@ -264,6 +284,11 @@ protected:
 	void updateWindowTitle();
 
 protected slots:
+	// Background folder-scan results (Phase B fork patch)
+	void onScanFinished();
+	void onScanCanceled();
+	void pumpMetaQueue();
+
 	void playCurrent();
 	void itemActivated(const QModelIndex & index );
 	void headerClicked(int index);
@@ -300,6 +325,11 @@ protected slots:
 	void setDurationColumnVisible(bool b);
 	void setFilenameColumnVisible(bool b);
 	void setShuffleColumnVisible(bool b);
+
+	// Phase C3 fork patch: row-thumbnail mode.
+	void onShowThumbnailsToggled(bool b);
+	void onPlaylistThumbReady(const QString & filename);
+	void onThumbnailSizeSelected();
 
 #ifdef DELAYED_PLAY
 	void playItemLater();
@@ -387,6 +417,9 @@ protected:
 	MyAction * showDurationColumnAct;
 	MyAction * showFilenameColumnAct;
 	MyAction * showShuffleColumnAct;
+	MyAction * showThumbnailsAct;     // Phase C3 fork patch: thumbnail-row toggle
+	QMenu * thumb_size_menu;          // submenu of size presets
+	PlaylistThumbDelegate * thumb_delegate;
 
 	QSettings * set;
 
@@ -427,6 +460,27 @@ private:
 #ifdef PLAYLIST_DELETE_FROM_DISK
 	bool allow_delete_from_disk;
 #endif
+
+	// Async folder scan + cancellable progress (Phase B fork patch).
+	// Declared last so the constructor init-list order matches.
+	QFutureWatcher<QStringList> * scan_watcher;
+	QProgressDialog * scan_progress;
+	QAtomicInt scan_cancel;
+	bool bulk_loading;
+
+	// Phase C1 fork patch: window geometry stashed at loadSettings time
+	// and applied once we have a top-level window to apply it to.
+	QByteArray pending_geometry;
+
+	// Lazy/async per-file metadata fetch — honors auto_get_info without
+	// blocking the GUI (Phase B fork patch). Uses ffprobe via async QProcess
+	// on the GUI thread (no worker threads — QProcess + smplayer's globals
+	// are not safe under QtConcurrent).
+	QStringList meta_queue;
+	QList<QProcess *> active_meta_procs;
+
+	void enqueueMetaFetch(const QStringList & files);
+	void updateRowMetadata(const QString & filename, const QString & name, double duration);
 };
 
 #endif

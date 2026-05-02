@@ -255,9 +255,13 @@ static QStringList modToString(Qt::KeyboardModifiers k)
 		l << "Meta";
 	if ( k & Qt::GroupSwitchModifier )
 		{;}
+	// Phase F fork patch: preserve KeypadModifier so numpad keys are
+	// distinguishable from their main-row twins. QKeySequence's textual
+	// form for the keypad modifier is "Num+", which round-trips through
+	// QKeySequence::fromString back to Qt::KeypadModifier.
 	if ( k & Qt::KeypadModifier )
-		{;}
-	
+		l << "Num";
+
 	return l;
 }
 
@@ -480,11 +484,16 @@ void ShortcutGetter::setText()
 			
 	if ( lKeys.contains("Meta") )
 		seq << "Meta";
-			
+
+	// Phase F fork patch: "Num" goes after Shift/Ctrl/Alt/Meta but
+	// before the key itself, matching the conventional "Ctrl+Num+1" form.
+	if ( lKeys.contains("Num") )
+		seq << "Num";
+
 	foreach ( QString s, lKeys ) {
 		//qDebug("setText: s: '%s'", s.toUtf8().data());
 		if ( s != "Shift" && s != "Ctrl"
-			&& s != "Alt" && s != "Meta" )
+			&& s != "Alt" && s != "Meta" && s != "Num" )
 			seq << s;
 	}
 			

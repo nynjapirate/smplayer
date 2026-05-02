@@ -47,6 +47,10 @@
 #include <QDesktopServices>
 #include <QClipboard>
 #include <QDebug>
+#include <QtConcurrent/QtConcurrent>
+#include <QProgressDialog>
+#include <QDockWidget>
+#include <QSet>
 
 #if QT_VERSION >= 0x050000
 #include <QUrlQuery>
@@ -67,6 +71,8 @@
 #include "version.h"
 #include "extensions.h"
 #include "guiconfig.h"
+#include "playlistthumbprovider.h"
+#include "playlistthumbdelegate.h"
 
 #ifdef CHROMECAST_SUPPORT
 #include "chromecast.h"
@@ -88,6 +94,51 @@
 #if USE_INFOPROVIDER
 #include "infoprovider.h"
 #endif
+
+// Phase B fork patch: iterative directory walker that runs on a worker thread.
+// Replaces unbounded recursion + synchronous mpv probes that froze the GUI on
+// folders > ~50 files. Returns absolute paths matching the multimedia ext set.
+namespace {
+// Up to this many concurrent mpv probes for the lazy metadata fetch. Two is
+// plenty: throughput-limited by mpv-startup + ffprobe, and we want headroom
+// for the user's actual playback mpv instance.
+const int kMaxMetaWorkers = 2;
+
+QStringList scanDirectoryWorker(QString root, bool recursive, QStringList exts, QAtomicInt * cancel)
+{
+	QStringList found;
+	QSet<QString> ext_set;
+	for (const QString & e : exts) ext_set.insert(e.toLower());
+
+	QStringList queue;
+	queue << root;
+	QSet<QString> visited;
+
+	while (!queue.isEmpty()) {
+		if (cancel->loadAcquire()) break;
+		QString cur = queue.takeFirst();
+		QString canon = QFileInfo(cur).canonicalFilePath();
+		if (canon.isEmpty()) canon = cur;
+		if (visited.contains(canon)) continue;
+		visited.insert(canon);
+
+		QDir dir(cur);
+		QFileInfoList entries = dir.entryInfoList(
+			QDir::AllEntries | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+		for (const QFileInfo & fi : entries) {
+			if (cancel->loadAcquire()) return found;
+			if (fi.isDir()) {
+				if (recursive) queue.append(fi.absoluteFilePath());
+			} else if (fi.isFile()) {
+				if (ext_set.contains(fi.suffix().toLower())) {
+					found << fi.absoluteFilePath();
+				}
+			}
+		}
+	}
+	return found;
+}
+}  // anonymous namespace
 
 #define DRAG_ITEMS 0
 #define PL_ALLOW_DUPLICATES 1
@@ -293,7 +344,11 @@ Playlist::Playlist(QWidget * parent, Qt::WindowFlags f)
 #ifdef PLAYLIST_DELETE_FROM_DISK
 	, allow_delete_from_disk(false)
 #endif
+	, scan_watcher(0)
+	, scan_progress(0)
+	, bulk_loading(false)
 {
+	scan_cancel.storeRelease(0);
 	playlist_path = "";
 	latest_dir = "";
 
@@ -368,6 +423,21 @@ Playlist::Playlist(QWidget * parent, Qt::WindowFlags f)
 }
 
 Playlist::~Playlist() {
+	// Phase B fork patch: make sure a folder scan in flight cannot outlive us.
+	if (scan_watcher) {
+		scan_cancel.storeRelease(1);
+		if (scan_watcher->isRunning()) scan_watcher->waitForFinished();
+	}
+	// Stop dispatching new metadata fetches and tear down anything in flight.
+	meta_queue.clear();
+	for (QProcess * p : active_meta_procs) {
+		p->disconnect(this);
+		p->kill();
+		p->waitForFinished(200);
+		delete p;
+	}
+	active_meta_procs.clear();
+
 	saveSettings();
 	if (set) delete set;
 
@@ -448,6 +518,14 @@ void Playlist::createTable() {
 #if USE_ITEM_DELEGATE
 	listView->setItemDelegateForColumn(COL_NAME, pl_delegate);
 	//listView->setItemDelegateForColumn(COL_FILENAME, pl_delegate);
+#else
+	// Phase C3 fork patch: install our thumb-aware delegate on EVERY
+	// column, not just COL_NAME. The thumbnail logic only kicks in for
+	// COL_NAME, but the per-state row colours (playing / selected /
+	// playing+selected) are drawn for every column so the entire row
+	// reads as one coloured strip.
+	thumb_delegate = new PlaylistThumbDelegate(this);
+	listView->setItemDelegate(thumb_delegate);
 #endif
 
 	listView->setObjectName("playlist_table");
@@ -491,6 +569,40 @@ void Playlist::createTable() {
 	listView->setDropIndicatorShown(true);
 	listView->setDragDropMode(QAbstractItemView::InternalMove);
 #endif
+	// Phase C2 fork patch: drag-drop reorder. Kept under the same gate as
+	// upstream's old DRAG_ITEMS, but enabled regardless and without forcing
+	// SingleSelection (we keep ExtendedSelection so multi-row drag works).
+	listView->setDragEnabled(true);
+	listView->setAcceptDrops(true);
+	listView->setDropIndicatorShown(true);
+	listView->setDragDropMode(QAbstractItemView::InternalMove);
+	listView->setDefaultDropAction(Qt::MoveAction);
+	// Phase C2 fork patch: QStandardItemModel's built-in InternalMove
+	// serialises the row through QMimeData and reconstitutes it as a plain
+	// QStandardItem on drop — losing the PLItem subclass identity (the
+	// sibling pointers col_num/col_duration/etc become garbage). That's
+	// what was clobbering both the source and destination row text. We
+	// intercept the QDropEvent here and do the move ourselves with
+	// takeRow/insertRow which preserves the live PLItem objects.
+	listView->viewport()->installEventFilter(this);
+
+	// After a row insert/remove (manual drop, external-file drop, removal,
+	// etc.) the COL_NUM column would be stale. Renumber so position numbers
+	// always match the visible row order.
+	connect(table, &QStandardItemModel::rowsInserted, this, [this]() {
+		for (int i = 0; i < table->rowCount(); ++i) {
+			PLItem * it = itemData(i);
+			if (it) it->setPosition(i + 1);
+		}
+		setModified(true);
+	});
+	connect(table, &QStandardItemModel::rowsRemoved, this, [this]() {
+		for (int i = 0; i < table->rowCount(); ++i) {
+			PLItem * it = itemData(i);
+			if (it) it->setPosition(i + 1);
+		}
+		setModified(true);
+	});
 
 	connect(listView, SIGNAL(activated(const QModelIndex &)),
             this, SLOT(itemActivated(const QModelIndex &)) );
@@ -605,6 +717,33 @@ void Playlist::createActions() {
 	showShuffleColumnAct = new MyAction(this, "pl_show_shuffle_column");
 	showShuffleColumnAct->setCheckable(true);
 	connect(showShuffleColumnAct, SIGNAL(toggled(bool)), this, SLOT(setShuffleColumnVisible(bool)));
+
+	// Phase C3 fork patch: row-thumbnail toggle + size submenu.
+	showThumbnailsAct = new MyAction(this, "pl_show_thumbnails");
+	showThumbnailsAct->setCheckable(true);
+	showThumbnailsAct->setChecked(PlaylistThumbProvider::instance()->enabled());
+	connect(showThumbnailsAct, SIGNAL(toggled(bool)), this, SLOT(onShowThumbnailsToggled(bool)));
+	connect(PlaylistThumbProvider::instance(),
+	        SIGNAL(thumbnailReady(const QString &)),
+	        this, SLOT(onPlaylistThumbReady(const QString &)));
+
+	thumb_size_menu = new QMenu(this);
+	const int currentH = PlaylistThumbProvider::instance()->rowHeight();
+	const struct { const char * label; int h; } sizes[] = {
+		{ QT_TR_NOOP("Small (64 px)"),    64 },
+		{ QT_TR_NOOP("Medium (96 px)"),   96 },
+		{ QT_TR_NOOP("Large (128 px)"),  128 },
+		{ QT_TR_NOOP("XL (192 px)"),     192 },
+	};
+	QActionGroup * sizeGroup = new QActionGroup(thumb_size_menu);
+	for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i) {
+		QAction * a = thumb_size_menu->addAction(tr(sizes[i].label));
+		a->setCheckable(true);
+		a->setChecked(currentH == sizes[i].h);
+		a->setData(sizes[i].h);
+		sizeGroup->addAction(a);
+		connect(a, SIGNAL(triggered()), this, SLOT(onThumbnailSizeSelected()));
+	}
 }
 
 void Playlist::createToolbar() {
@@ -718,6 +857,9 @@ void Playlist::createToolbar() {
 	popup->addAction(openURLInWebAct);
 #endif
 	popup->addSeparator();
+	popup->addAction(showThumbnailsAct);
+	thumb_size_menu->setTitle(tr("Thumbnail size"));
+	popup->addMenu(thumb_size_menu);
 	popup->addAction(showPositionColumnAct);
 	popup->addAction(showNameColumnAct);
 	popup->addAction(showDurationColumnAct);
@@ -778,6 +920,7 @@ void Playlist::retranslateStrings() {
 #endif
 
 	showSearchAct->change(Images::icon("find"), tr("Search"));
+	showThumbnailsAct->change(tr("Show thumbnails (row preview)"));
 
 	showPositionColumnAct->change(tr("Show position column"));
 	showNameColumnAct->change(tr("Show name column"));
@@ -824,7 +967,9 @@ void Playlist::filterEditChanged(const QString & text) {
 	setFilter(text);
 
 	if (text.isEmpty()) {
-		qApp->processEvents();
+		// Phase B fork patch: dropped qApp->processEvents() — re-entrant event
+		// processing inside a filter callback was a freeze/crash vector under
+		// large playlists.
 		listView->scrollTo(listView->currentIndex(), QAbstractItemView::PositionAtCenter);
 	}
 }
@@ -1766,16 +1911,16 @@ void Playlist::addFiles() {
 }
 
 void Playlist::addFiles(QStringList files, AutoGetInfo auto_get_info) {
-	qDebug("Playlist::addFiles");
+	qDebug("Playlist::addFiles: %d file(s)", files.count());
 
 	#if USE_INFOPROVIDER
-	bool get_info = (auto_get_info == GetInfo);
-	if (auto_get_info == UserDefined) {
-		get_info = automatically_get_info;
-	}
-
-	MediaData data;
-	setCursor(Qt::WaitCursor);
+	// Phase B fork patch: never call InfoProvider synchronously — each call
+	// spawns an mpv subprocess and a single one is ~100–300 ms, which froze
+	// the GUI on 50+ files. The user's "Get info automatically about files
+	// added (slow)" preference is now honoured *asynchronously* via the
+	// background meta-fetch queue (see enqueueMetaFetch / pumpMetaQueue).
+	const bool want_info = (auto_get_info == GetInfo) ||
+	                        (auto_get_info == UserDefined && automatically_get_info);
 	#endif
 
 	QString initial_file;
@@ -1788,32 +1933,42 @@ void Playlist::addFiles(QStringList files, AutoGetInfo auto_get_info) {
 		if (new_current_item != -1) clear();
 	}
 
+	// Phase B fork patch: temporarily suppress proxy re-sort/re-filter and view
+	// repaints during bulk insert. Each appendRow would otherwise trigger an
+	// O(N) proxy rebuild → inserting N rows became O(N^2) repaints.
+	const bool batch = (files.count() > 32);
+	bool prev_dyn = false;
+	if (batch) {
+		listView->setUpdatesEnabled(false);
+		prev_dyn = proxy->dynamicSortFilter();
+		proxy->setDynamicSortFilter(false);
+	}
+
 	for (int n = 0; n < files.count(); n++) {
-		QString name = "";
-		double duration = 0;
-		#if USE_INFOPROVIDER
-		if ( (get_info) && (QFile::exists(files[n])) ) {
-			data = InfoProvider::getInfo(files[n]);
-			name = data.displayName(change_name);
-			duration = data.duration;
-			//qApp->processEvents();
-		}
-		#endif
-
-		//qDebug() << "Playlist::addFiles: comparing:" << initial_file << "with" << files[n];
-
-		addItem(files[n], name, duration);
-
+		addItem(files[n], "", 0);
 		if (QFile::exists(files[n])) {
 			latest_dir = QFileInfo(files[n]).absolutePath();
 		}
 	}
-	#if USE_INFOPROVIDER
-	unsetCursor();
-	#endif
+
+	if (batch) {
+		proxy->setDynamicSortFilter(prev_dyn);
+		listView->setUpdatesEnabled(true);
+	}
 
 	if (new_current_item != -1) setCurrentItem(new_current_item);
 	if (shuffleAct->isChecked()) shuffle(true);
+
+	#if USE_INFOPROVIDER
+	if (want_info) {
+		QStringList local_files;
+		for (int n = 0; n < files.count(); n++) {
+			if (QFile::exists(files[n])) local_files << files[n];
+		}
+		if (!local_files.isEmpty()) enqueueMetaFetch(local_files);
+	}
+	#endif
+
 	qDebug() << "Playlist::addFiles: latest_dir:" << latest_dir;
 }
 
@@ -1870,19 +2025,171 @@ void Playlist::addOneDirectory(QString dir) {
 	addFiles(filelist);
 }
 
+// Phase B fork patch: replaced unbounded recursion + main-thread filesystem
+// walk with an iterative BFS on a QtConcurrent worker. Cancellable via the
+// progress dialog's cancel button. Falls through to onScanFinished() on the
+// GUI thread to do the model insert.
 void Playlist::addDirectory(QString dir) {
-	addOneDirectory(dir);
+	if (scan_watcher && scan_watcher->isRunning()) {
+		qDebug("Playlist::addDirectory: scan already in progress, ignoring '%s'", dir.toUtf8().data());
+		return;
+	}
 
-	if (recursive_add_directory) {
-		QFileInfoList dir_list = QDir(dir).entryInfoList(QStringList() << "*", QDir::AllDirs | QDir::NoDotAndDotDot);
-		for (int n=0; n < dir_list.count(); n++) {
-			if (dir_list[n].isDir()) {
-				qDebug("Playlist::addDirectory: adding directory: %s", dir_list[n].filePath().toUtf8().data());
-				addDirectory(dir_list[n].filePath());
+	scan_cancel.storeRelease(0);
+
+	if (!scan_progress) {
+		scan_progress = new QProgressDialog(this);
+		scan_progress->setWindowModality(Qt::WindowModal);
+		scan_progress->setAutoClose(true);
+		scan_progress->setAutoReset(true);
+		scan_progress->setMinimumDuration(400);  // don't flash for sub-second scans
+		connect(scan_progress, SIGNAL(canceled()), this, SLOT(onScanCanceled()));
+	}
+	scan_progress->setLabelText(tr("Scanning %1…").arg(dir));
+	scan_progress->setRange(0, 0);  // indeterminate spinner
+	scan_progress->reset();
+	scan_progress->show();
+
+	if (!scan_watcher) {
+		scan_watcher = new QFutureWatcher<QStringList>(this);
+		connect(scan_watcher, SIGNAL(finished()), this, SLOT(onScanFinished()));
+	}
+
+	Extensions e;
+	QStringList exts = e.multimedia();
+	bool recursive = recursive_add_directory;
+
+	QFuture<QStringList> f = QtConcurrent::run(
+		&scanDirectoryWorker, dir, recursive, exts, &scan_cancel);
+	scan_watcher->setFuture(f);
+}
+
+void Playlist::onScanFinished() {
+	if (!scan_watcher) return;
+	QStringList files = scan_watcher->result();
+
+	if (scan_progress) scan_progress->reset();  // hides
+
+	if (scan_cancel.loadAcquire()) {
+		qDebug("Playlist::onScanFinished: scan canceled (%d files found before cancel)", files.count());
+		return;
+	}
+
+	qDebug("Playlist::onScanFinished: scan returned %d file(s)", files.count());
+	if (files.isEmpty()) return;
+
+	bulk_loading = true;
+	// addFiles(NoGetInfo) inserts the rows immediately (no metadata).
+	// addFiles itself does NOT enqueue metadata fetch because we forced
+	// NoGetInfo. We enqueue here, separately, *only* if the user has
+	// auto_get_info on — that way the user's pref is honoured but the
+	// fetch runs asynchronously instead of blocking the main thread.
+	addFiles(files, NoGetInfo);
+	bulk_loading = false;
+
+	if (latest_dir.isEmpty() && !files.isEmpty()) {
+		latest_dir = QFileInfo(files.first()).absolutePath();
+	}
+
+	#if USE_INFOPROVIDER
+	if (automatically_get_info) {
+		enqueueMetaFetch(files);
+	}
+	#endif
+
+	setModified(true);
+}
+
+void Playlist::onScanCanceled() {
+	scan_cancel.storeRelease(1);
+}
+
+// Phase B fork patch: enqueue files for background metadata population.
+// Honours the user's "Get info automatically" preference without ever
+// blocking the GUI thread on a synchronous probe.
+void Playlist::enqueueMetaFetch(const QStringList & files) {
+	for (const QString & f : files) {
+		if (!meta_queue.contains(f)) meta_queue.append(f);
+	}
+	qDebug("Playlist::enqueueMetaFetch: queue depth %d (+%d)", meta_queue.count(), files.count());
+	pumpMetaQueue();
+}
+
+void Playlist::pumpMetaQueue() {
+	// ffprobe is faster than mpv for duration-only and runs in a child
+	// process so the cost on us is just QProcess on the GUI thread.
+	while (active_meta_procs.size() < kMaxMetaWorkers && !meta_queue.isEmpty()) {
+		QString file = meta_queue.takeFirst();
+		QProcess * p = new QProcess(this);
+		p->setProperty("filename", file);
+
+		auto cleanup = [this, p]() {
+			p->disconnect(this);  // make sure we don't fire twice
+			active_meta_procs.removeOne(p);
+			p->deleteLater();
+			pumpMetaQueue();
+		};
+
+		connect(p, static_cast<void (QProcess::*)(int, QProcess::ExitStatus)>(&QProcess::finished),
+		        this, [this, p, cleanup](int /*exit_code*/, QProcess::ExitStatus /*status*/) {
+			QString filename = p->property("filename").toString();
+			QString out = QString::fromUtf8(p->readAllStandardOutput()).trimmed();
+			bool ok = false;
+			double duration = out.toDouble(&ok);
+			if (ok && duration > 0) {
+				updateRowMetadata(filename, QString(), duration);
 			}
+			cleanup();
+		});
+		connect(p, &QProcess::errorOccurred, this,
+		        [cleanup](QProcess::ProcessError) { cleanup(); });
+
+		QStringList args;
+		args << "-v" << "error"
+		     << "-show_entries" << "format=duration"
+		     << "-of" << "default=noprint_wrappers=1:nokey=1"
+		     << file;
+		p->start("ffprobe", args);
+		active_meta_procs.append(p);
+	}
+}
+
+// Update the playlist row whose stored filename matches `filename`. No-op if
+// the row was removed in the meantime (e.g. user cleared the playlist before
+// the background fetch returned).
+void Playlist::updateRowMetadata(const QString & filename, const QString & name, double duration) {
+	const int rows = table->rowCount();
+	for (int i = 0; i < rows; ++i) {
+		PLItem * item = itemData(i);
+		if (!item) continue;
+		if (item->filename() == filename) {
+			if (!name.isEmpty()) item->setName(name);
+			if (duration > 0)    item->setDuration(duration);
+			return;
 		}
 	}
-	setModified(true);
+}
+
+// Phase E fork patch: drop the row whose stored filename matches `filename`.
+// Mirrors the safe-removal pattern from removeSelected/deleteSelectedFileFromDisk:
+// after the row is gone, if the playlist's "current" pointer became invalid
+// (the removed row was the playing one), reassign it to the previous-or-zero
+// index so the next-track logic still has somewhere to land. mpv is NOT
+// stopped — its file handle is still valid and playback continues.
+void Playlist::removeRowByFilename(const QString & filename) {
+	for (int i = 0; i < table->rowCount(); ++i) {
+		PLItem * it = itemData(i);
+		if (!it) continue;
+		if (it->filename() != filename) continue;
+		table->removeRow(i);
+		if (findCurrentItem() == -1) {
+			int next_current = i - 1;
+			if (next_current < 0) next_current = 0;
+			setCurrentItem(next_current);
+		}
+		setModified(true);
+		return;
+	}
 }
 
 // Remove selected items
@@ -2243,7 +2550,120 @@ void Playlist::hideEvent( QHideEvent * ) {
 }
 
 void Playlist::showEvent( QShowEvent * ) {
+	// Phase C1 fork patch: when the playlist becomes visible, the dock has
+	// already been shown floating (or we're a stand-alone window) so this
+	// is the right moment to push the persisted geometry onto the actual
+	// top-level. Idempotent — the blob is consumed on first apply.
+	applyPendingGeometry();
 	emit visibilityChanged(true);
+}
+
+void Playlist::onShowThumbnailsToggled(bool b) {
+	PlaylistThumbProvider::instance()->setEnabled(b);
+	// sizeHint of the delegate now returns a different height; force the
+	// view to recompute row heights. Trigger a layout reset.
+	listView->viewport()->update();
+	listView->resizeRowsToContents();
+}
+
+void Playlist::onThumbnailSizeSelected() {
+	QAction * a = qobject_cast<QAction*>(sender());
+	if (!a) return;
+	const int h = a->data().toInt();
+	if (h <= 0) return;
+	PlaylistThumbProvider::instance()->setRowHeight(h);
+	// Cached pixmaps are at the old size. The provider keys by (filename,
+	// height) so cache hits at the new height won't collide; pumping the
+	// queue will refill on the next paint.
+	listView->viewport()->update();
+	listView->resizeRowsToContents();
+}
+
+void Playlist::onPlaylistThumbReady(const QString & filename) {
+	// Find every row showing this file and repaint it. Cheap O(N) scan;
+	// playlists rarely exceed a few thousand rows.
+	for (int i = 0; i < table->rowCount(); ++i) {
+		PLItem * it = itemData(i);
+		if (!it) continue;
+		if (it->filename() == filename) {
+			QModelIndex src = table->index(i, COL_NAME);
+			QModelIndex p = proxy->mapFromSource(src);
+			if (p.isValid()) listView->update(p);
+		}
+	}
+}
+
+bool Playlist::eventFilter(QObject * obj, QEvent * event) {
+	if (obj == listView->viewport() && event->type() == QEvent::Drop) {
+		QDropEvent * de = static_cast<QDropEvent*>(event);
+		if (de->source() == listView) {
+			handleInternalDrop(de);
+			return true;  // consume so QStandardItemModel doesn't reserialise
+		}
+	}
+	return QWidget::eventFilter(obj, event);
+}
+
+void Playlist::handleInternalDrop(QDropEvent * de) {
+	// Resolve the drop position to a SOURCE-model row index (the proxy may
+	// be sorting/filtering, so view rows ≠ source rows).
+	int dest_src_row = table->rowCount();  // default: append at end
+	const QModelIndex view_idx = listView->indexAt(de->pos());
+	if (view_idx.isValid()) {
+		const QModelIndex src_idx = proxy->mapToSource(view_idx);
+		dest_src_row = src_idx.row();
+		// If the cursor is in the bottom half of the row, insert below it.
+		const QRect r = listView->visualRect(view_idx);
+		if (de->pos().y() > r.center().y()) ++dest_src_row;
+	}
+
+	// Collect selected rows (source-model coords), de-duplicated and sorted.
+	const QModelIndexList sel = listView->selectionModel()->selectedRows();
+	QList<int> source_rows;
+	for (const QModelIndex & idx : sel) {
+		const int r = proxy->mapToSource(idx).row();
+		if (!source_rows.contains(r)) source_rows.append(r);
+	}
+	std::sort(source_rows.begin(), source_rows.end());
+	if (source_rows.isEmpty()) { de->ignore(); return; }
+
+	// Take rows out of the model, descending so earlier indices stay valid.
+	// takeRow returns the live QStandardItem* siblings — PLItem identity is
+	// preserved, so position-renumber and downstream code keep working.
+	QList<QList<QStandardItem*>> taken;
+	for (int i = source_rows.size() - 1; i >= 0; --i) {
+		const int r = source_rows[i];
+		taken.prepend(table->takeRow(r));
+		if (r < dest_src_row) --dest_src_row;
+	}
+
+	// Insert the taken rows at the destination, in order.
+	for (int i = 0; i < taken.size(); ++i) {
+		table->insertRow(dest_src_row + i, taken[i]);
+	}
+
+	de->setDropAction(Qt::MoveAction);
+	de->accept();
+}
+
+QWidget * Playlist::ownTopLevelWindow() const {
+	if (isWindow()) return const_cast<Playlist*>(this);
+	for (QWidget * p = parentWidget(); p; p = p->parentWidget()) {
+		if (QDockWidget * d = qobject_cast<QDockWidget*>(p)) {
+			return d->isFloating() ? d : 0;
+		}
+		if (p->isWindow()) return 0;  // hit a non-dock top-level (main window)
+	}
+	return 0;
+}
+
+void Playlist::applyPendingGeometry() {
+	if (pending_geometry.isEmpty()) return;
+	QWidget * w = ownTopLevelWindow();
+	if (!w) return;
+	if (w->restoreGeometry(pending_geometry)) {
+		pending_geometry.clear();  // applied; don't re-apply on next showEvent
+	}
 }
 
 void Playlist::closeEvent( QCloseEvent * e )  {
@@ -2293,8 +2713,13 @@ void Playlist::saveSettings() {
 
 	set->setValue( "row_spacing", row_spacing );
 
-	if (isWindow()) { // No dockable
-		set->setValue( "size", size() );
+	// Phase C1 fork patch: persist full geometry (pos + size + maximised
+	// state) of whichever window owns us — stand-alone Playlist when
+	// dockable_playlist=false, or the floating QDockWidget when dockable.
+	// We deliberately don't write geometry when docked into a main window
+	// because that's not our window to claim.
+	if (QWidget * w = ownTopLevelWindow()) {
+		set->setValue( "geometry", w->saveGeometry() );
 	}
 
 #ifdef PLAYLIST_DELETE_FROM_DISK
@@ -2376,9 +2801,11 @@ void Playlist::loadSettings() {
 
 	row_spacing = set->value( "row_spacing", row_spacing ).toInt();
 
-	if (isWindow()) { // No dockable
-		resize( set->value("size", size()).toSize() );
-	}
+	// Phase C1 fork patch: stash the geometry blob; we apply it once a
+	// top-level window exists (showEvent for stand-alone, or the dock's
+	// topLevelChanged → showEvent path when it floats).
+	pending_geometry = set->value("geometry").toByteArray();
+	applyPendingGeometry();
 
 #ifdef PLAYLIST_DELETE_FROM_DISK
 	allow_delete_from_disk = set->value("allow_delete_from_disk", allow_delete_from_disk).toBool();

@@ -54,6 +54,7 @@
 #include "preferences.h"
 #include "discname.h"
 #include "timeslider.h"
+#include "thumbnailprovider.h"
 #include "logwindow.h"
 #include "infowindow.h"
 #include "playlist.h"
@@ -89,6 +90,7 @@
 
 #include "config.h"
 #include "actionseditor.h"
+#include "toolbaroverrides.h"
 
 #ifdef TV_SUPPORT
 #include "tvlist.h"
@@ -2252,6 +2254,17 @@ void BaseGui::retranslateStrings() {
 	// It has to be done, here. The actions are translated after the
 	// preferences dialog.
 	if (pref_dialog) pref_dialog->mod_input()->actions_editor->updateView();
+
+	// Phase G fork patch: retranslateStrings just blasted every action's
+	// text via tr(). Re-apply user overrides AFTER, so "Change Text" /
+	// "Change Icon" customizations survive (a) startup, where Qt posts a
+	// QEvent::LanguageChange asynchronously after Translator install, and
+	// (b) any later language change. Without this hook, overrides got wiped
+	// on every retranslate.
+	ToolbarOverrides::applyToActions(this->findChildren<QAction*>());
+	if (playlist && playlist->isWindow()) {
+		ToolbarOverrides::applyToActions(playlist->findChildren<QAction*>());
+	}
 }
 
 void BaseGui::setJumpTexts() {
@@ -2278,6 +2291,13 @@ void BaseGui::setWindowCaption(const QString & title) {
 
 void BaseGui::createCore() {
 	core = new Core( mplayerwindow, this );
+
+	// Phase D fork patch: feed playback file + duration into the hover-thumbnail
+	// provider singleton so the seekbar tooltip can preview frames.
+	connect(core, SIGNAL(mediaPlaying(const QString &, const QString &)),
+	        ThumbnailProvider::instance(), SLOT(setCurrentFile(const QString &, const QString &)));
+	connect(core, SIGNAL(newDuration(double)),
+	        ThumbnailProvider::instance(), SLOT(setDuration(double)));
 
 	connect( core, SIGNAL(menusNeedInitialize()),
              this, SLOT(initializeMenus()) );
@@ -5933,6 +5953,12 @@ void BaseGui::loadActions() {
 	if (playlist->isWindow()) { // No dockable
 		actions_list += ActionsEditor::actionsNames(playlist);
 	}
+
+	// Phase G fork patch: apply per-action icon/text overrides.
+	ToolbarOverrides::applyToActions(this->findChildren<QAction*>());
+	if (playlist->isWindow()) {
+		ToolbarOverrides::applyToActions(playlist->findChildren<QAction*>());
+	}
 }
 
 void BaseGui::saveActions() {
@@ -6347,12 +6373,19 @@ void BaseGui::changeEvent(QEvent *e) {
 
 #ifdef NUMPAD_WORKAROUND
 // Due to a bug in Qt 5 on linux, accelerators in numeric keypad don't work
-// This catches the key presses in the numeric keypad and calls the associated action
+// This catches the key presses in the numeric keypad and calls the associated action.
+//
+// Phase F fork patch: include the full modifier set (Shift/Ctrl/Alt/Meta AND
+// KeypadModifier) when constructing the lookup key, so the workaround only
+// fires shortcuts that explicitly opted into the numpad. Without this, a
+// shortcut bound to "1" used to also fire on Numpad-1 — which collapsed the
+// distinction the user actually wants to keep.
 void BaseGui::keyPressEvent(QKeyEvent *event) {
 	if (event->modifiers().testFlag(Qt::KeypadModifier)) {
 		qDebug() << "BaseGui::keyPressEvent: key:" << event->key() << "modifiers:" << event->modifiers();
 
-		QKeySequence ks(event->key());
+		const int key_with_mods = int(event->modifiers()) | event->key();
+		QKeySequence ks(key_with_mods);
 		QList<QAction *> actions = this->actions();
 		foreach(QAction * action, actions) {
 			QList<QKeySequence> shortcuts = action->shortcuts();

@@ -20,11 +20,21 @@
 #include "helper.h"
 #include "global.h"
 #include "preferences.h"
+#include "timetooltip.h"
+#include "thumbnailprovider.h"
 
+#include <QCursor>
 #include <QWheelEvent>
+#include <QMouseEvent>
+#include <QContextMenuEvent>
+#include <QMenu>
+#include <QAction>
+#include <QActionGroup>
 #include <QTimer>
 #include <QToolTip>
 #include <QStyleOption>
+#include <QStylePainter>
+#include <QPaintEvent>
 #include <QDebug>
 
 using Global::pref;
@@ -37,7 +47,13 @@ TimeSlider::TimeSlider( QWidget * parent ) : MySlider(parent)
 	, start_drag_pos(-1)
 	, slider_has_moved(false)
 	, total_time(0)
+	, thumb_tooltip(0)
+	, last_hover_bucket_ms(-1)
 {
+	setMouseTracking(true);
+	connect(ThumbnailProvider::instance(),
+	        SIGNAL(thumbnailReady(qint64, QImage)),
+	        this, SLOT(onThumbnailReady(qint64, QImage)));
 	setMinimum(0);
 #ifdef SEEKBAR_RESOLUTION
 	setMaximum(SEEKBAR_RESOLUTION);
@@ -179,28 +195,187 @@ void TimeSlider::wheelEvent(QWheelEvent * e) {
 
 bool TimeSlider::event(QEvent *event) {
 	if (event->type() == QEvent::ToolTip) {
-		QHelpEvent * help_event = static_cast<QHelpEvent *>(event);
-		//qDebug() << "TimeSlider::event: x:" << help_event->x() << "maximum:" << maximum() << "width:" << width() << "total_time:" << total_time;
-
-		QStyleOptionSlider opt;
-		initStyleOption(&opt);
-		const QRect sliderRect = style()->subControlRect(QStyle::CC_Slider, &opt, QStyle::SC_SliderHandle, this);
-		const QPoint center = sliderRect.center() - sliderRect.topLeft();
-
-		int value = pixelPosToRangeValue(help_event->x() - center.x());
-		int range = maximum() - minimum();
-		qreal time = value * total_time / range;
-		//qDebug() << "TimeSlider::event: value:" << value << "range:" << range << "time:" << time;
-
-		if (time >= 0 && time <= total_time) {
-			QToolTip::showText(help_event->globalPos(), Helper::formatTime(time), this);
-		} else {
-			QToolTip::hideText();
-			event->ignore();
-		}
+		// We handle the tooltip ourselves via mouseMoveEvent + thumb_tooltip,
+		// so the stock tooltip stays out of the way. Returning true tells
+		// Qt the event has been consumed.
+		event->ignore();
 		return true;
 	}
 	return QWidget::event(event);
+}
+
+void TimeSlider::leaveEvent(QEvent * event) {
+	if (thumb_tooltip) thumb_tooltip->hide();
+	last_hover_bucket_ms = -1;
+	MySlider::leaveEvent(event);
+}
+
+void TimeSlider::mouseMoveEvent(QMouseEvent * event) {
+	MySlider::mouseMoveEvent(event);
+	if (total_time <= 0) return;
+	updateHoverPreview(event->x());
+}
+
+QSize TimeSlider::sizeHint() const {
+	QSize s = MySlider::sizeHint();
+	s.setHeight(s.height() * 2);
+	return s;
+}
+
+QSize TimeSlider::minimumSizeHint() const {
+	QSize s = MySlider::minimumSizeHint();
+	s.setHeight(s.height() * 2);
+	return s;
+}
+
+QRect TimeSlider::naturalVisualRect() const {
+	// The vertically centred sub-rect at the slider's natural height —
+	// where we paint the groove + handle and where mouse-on-handle is
+	// detected for click-to-seek.
+	const int natural_h = MySlider::sizeHint().height();
+	if (height() <= natural_h) return rect();
+	const int top = (height() - natural_h) / 2;
+	return QRect(0, top, width(), natural_h);
+}
+
+void TimeSlider::paintEvent(QPaintEvent * /*event*/) {
+	QStylePainter p(this);
+	QStyleOptionSlider opt;
+	initStyleOption(&opt);
+
+	// QSlider::paintEvent normally sets these; we must too — without them
+	// the style draws nothing.
+	opt.subControls = QStyle::SC_SliderGroove | QStyle::SC_SliderHandle;
+	if (tickPosition() != NoTicks) opt.subControls |= QStyle::SC_SliderTickmarks;
+
+	opt.rect = naturalVisualRect();
+	p.drawComplexControl(QStyle::CC_Slider, opt);
+}
+
+void TimeSlider::mousePressEvent(QMouseEvent * event) {
+	// Replicate MySlider's click-to-seek but hit-test against the visual
+	// handle rect (the natural-sized one), not the full 2× widget. So a
+	// click in the empty band above/below the painted handle still seeks.
+	if (event->button() == Qt::LeftButton) {
+		QStyleOptionSlider opt;
+		initStyleOption(&opt);
+		opt.rect = naturalVisualRect();
+		const QRect handleRect = style()->subControlRect(
+			QStyle::CC_Slider, &opt, QStyle::SC_SliderHandle, this);
+		const QPoint centre = handleRect.center() - handleRect.topLeft();
+		if (!handleRect.contains(event->pos())) {
+			setSliderPosition(pixelPosToRangeValue(event->x() - centre.x()));
+			triggerAction(SliderMove);
+			setRepeatAction(SliderNoAction);
+		}
+		QSlider::mousePressEvent(event);
+	} else {
+		QSlider::mousePressEvent(event);
+	}
+}
+
+void TimeSlider::updateHoverPreview(int xLocal) {
+	QStyleOptionSlider opt;
+	initStyleOption(&opt);
+	opt.rect = naturalVisualRect();
+	const QRect handleRect = style()->subControlRect(
+		QStyle::CC_Slider, &opt, QStyle::SC_SliderHandle, this);
+	const QPoint centre = handleRect.center() - handleRect.topLeft();
+
+	const int value = pixelPosToRangeValue(xLocal - centre.x());
+	const int range = maximum() - minimum();
+	if (range <= 0) return;
+	const qreal time_sec = value * total_time / range;
+	if (time_sec < 0 || time_sec > total_time) return;
+
+	if (!thumb_tooltip) {
+		thumb_tooltip = new TimeTooltip(this);
+	}
+
+	// Anchor at the top of the *visual* slider band (not the widget's
+	// physical top, which is now padded by the extended height).
+	const QRect vis = naturalVisualRect();
+	const QPoint anchor = mapToGlobal(QPoint(xLocal, vis.top()));
+	thumb_tooltip->setAnchor(anchor);
+	thumb_tooltip->setTimeText(Helper::formatTime(time_sec));
+
+	const qint64 timeMs = qint64(time_sec * 1000.0);
+	const qint64 bkt = (timeMs / 1000) * 1000;
+	if (bkt != last_hover_bucket_ms) {
+		last_hover_bucket_ms = bkt;
+		ThumbnailProvider::instance()->requestThumbnail(timeMs);
+	}
+
+	if (!thumb_tooltip->isVisible()) thumb_tooltip->show();
+}
+
+void TimeSlider::onThumbnailReady(qint64 /*timeMs*/, const QImage & img) {
+	if (!thumb_tooltip || !thumb_tooltip->isVisible()) return;
+	thumb_tooltip->setThumbnail(img);
+}
+
+void TimeSlider::contextMenuEvent(QContextMenuEvent * event) {
+	// Right-click on the seek bar: quick toggles for the hover-thumbnail
+	// feature. Same shape as vlc-reborn's seekbar context menu.
+	ThumbnailProvider * tp = ThumbnailProvider::instance();
+
+	if (thumb_tooltip) {
+		thumb_tooltip->hide();
+		thumb_tooltip->clearThumbnail();
+	}
+
+	QMenu menu(this);
+	QAction * header = menu.addAction(tr("Hover Thumbnails"));
+	header->setEnabled(false);
+	menu.addSeparator();
+
+	QAction * toggle = menu.addAction(tr("Show on hover"));
+	toggle->setCheckable(true);
+	toggle->setChecked(tp->enabled());
+
+	QMenu * sizeMenu = menu.addMenu(tr("Size"));
+	const int currentW = tp->thumbWidth();
+	const struct { const char * label; int w; } sizes[] = {
+		{ "Small (160 px)",  160 },
+		{ "Medium (240 px)", 240 },
+		{ "Large (320 px)",  320 },
+		{ "XL (480 px)",     480 },
+	};
+	QActionGroup * sizeGroup = new QActionGroup(&menu);
+	for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i) {
+		QAction * a = sizeMenu->addAction(tr(sizes[i].label));
+		a->setCheckable(true);
+		a->setChecked(currentW == sizes[i].w);
+		a->setData(sizes[i].w);
+		sizeGroup->addAction(a);
+	}
+
+	QMenu * qMenu = menu.addMenu(tr("Quality"));
+	const int currentQ = tp->thumbQuality();
+	const struct { const char * label; int q; } qualities[] = {
+		{ "Low (60)",     60 },
+		{ "Medium (85)",  85 },
+		{ "High (95)",    95 },
+	};
+	QActionGroup * qGroup = new QActionGroup(&menu);
+	for (size_t i = 0; i < sizeof(qualities)/sizeof(qualities[0]); ++i) {
+		QAction * a = qMenu->addAction(tr(qualities[i].label));
+		a->setCheckable(true);
+		a->setChecked(currentQ == qualities[i].q);
+		a->setData(qualities[i].q);
+		qGroup->addAction(a);
+	}
+
+	QAction * picked = menu.exec(event->globalPos());
+	if (!picked) return;
+	if (picked == toggle) {
+		tp->setEnabled(!tp->enabled());
+	} else if (sizeGroup->actions().contains(picked)) {
+		tp->setThumbWidth(picked->data().toInt());
+	} else if (qGroup->actions().contains(picked)) {
+		tp->setThumbQuality(picked->data().toInt());
+	}
+	last_hover_bucket_ms = -1;  // force the next hover to re-request
 }
 
 #include "moc_timeslider.cpp"

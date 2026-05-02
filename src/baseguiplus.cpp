@@ -17,6 +17,7 @@
 */
 
 #include "baseguiplus.h"
+#include "custommove.h"
 #include "config.h"
 #include "myaction.h"
 #include "global.h"
@@ -94,6 +95,7 @@ BaseGuiPlus::BaseGuiPlus( QWidget * parent, Qt::WindowFlags flags)
 	, compact_playlist_was_visible(false)
 	, ignore_playlist_events(false)
 #endif
+	, custom_move(0)
 {
 	// Initialize variables
 	//infowindow_visible = false;
@@ -124,7 +126,13 @@ BaseGuiPlus::BaseGuiPlus( QWidget * parent, Qt::WindowFlags flags)
 #endif
 
 #ifdef PLAYLIST_DOCKABLE
-	if (pref->dockable_playlist) {
+	// Phase C2 fork patch: force the non-dockable / true-top-level path
+	// regardless of the user's `dockable_playlist` ini setting. The old
+	// QDockWidget floating mode only allowed resize on certain edges and
+	// didn't get its own taskbar entry; the standalone Qt::Window does
+	// both. /usr/bin/smplayer keeps its dockable behaviour — this only
+	// changes the dev fork.
+	if (false /* pref->dockable_playlist */) {
 		// Playlistdock
 		playlistdock = new PlaylistDock(this);
 		playlistdock->setObjectName("playlistdock");
@@ -162,6 +170,13 @@ BaseGuiPlus::BaseGuiPlus( QWidget * parent, Qt::WindowFlags flags)
 		connect(playlist, SIGNAL(visibilityChanged(bool)),
                 showPlaylistAct, SLOT(setChecked(bool)) );
 	}
+
+	// Phase E fork patch: instantiate the custom-move feature once core
+	// + playlist are wired. Construction registers 10 move actions plus
+	// "delete_current_file" as children of `this`, where ActionsEditor
+	// will discover them on the QTimer::singleShot(20, loadActions) call
+	// scheduled by BaseGui's ctor.
+	custom_move = new CustomMoveLocations(this);
 
 #if defined(DETACH_VIDEO_LAYER) && defined(DETACH_VIDEO_OPTION)
 	detachVideoAct = new MyAction(this, "detach_video");
@@ -740,6 +755,10 @@ void BaseGuiPlus::showPlaylist(bool b) {
 }
 
 void BaseGuiPlus::playlistClosed() {
+	// Phase C1 fork patch: snapshot the floating dock's final geometry
+	// before the X actually hides it, so the next session restores the
+	// playlist exactly where the user left it.
+	if (playlist) QMetaObject::invokeMethod(playlist, "saveSettings");
 	showPlaylistAct->setChecked(false);
 }
 

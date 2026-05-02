@@ -43,6 +43,7 @@ class PrefTV;
 class PrefUpdates;
 class PrefNetwork;
 class PrefAssociations;
+class PrefMoveLocations;
 
 class Preferences;
 
@@ -112,6 +113,7 @@ protected:
 	PrefUpdates * page_updates;
 	PrefNetwork * page_network;
 	PrefAdvanced * page_advanced;
+	PrefMoveLocations * page_move_locations;
 
 #if USE_ASSOCIATIONS
 	PrefAssociations* page_associations;
