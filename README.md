@@ -1,4 +1,4 @@
-# SMPlayer (gbit00 fork)
+# SMPlayer (nynjapirate fork)
 
 This is a personal fork of [SMPlayer 23.12.0](https://github.com/smplayer-dev/smplayer) with a set of feature patches including YouTube-style seekbar thumbnails, VLC-style playlist UX, keyboard-driven file management, and a more configurable toolbar editor.
 
